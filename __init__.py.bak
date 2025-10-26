@@ -24,11 +24,6 @@ bl_info = {
     "category": "Sequencer",
 }
 
-_AUDIO_PIPELINE_HINTS = {
-    "StableAudioPipeline",
-    "AudioLDM2Pipeline",
-}
-
 # TO DO: Move prints.
 # Pop-up for audio
 # Use a-z for batches
@@ -63,364 +58,16 @@ from bpy.props import (
 )
 import sys
 import base64
-import builtins
-from types import SimpleNamespace
-from PIL import Image
-import requests
-REMOTE_ONLY = True
-
-_orig_import = builtins.__import__
-
-def _blocked_import(name, *args, **kwargs):
-    root = name.split(".")[0]
-    # Serve stubs for diffusers/torch, block other local ML libs
-    if root == "diffusers":
-        mod = sys.modules.get("diffusers")
-        if mod is None:
-            # Defer to later stub registration, but ensure import doesn't crash
-            return ModuleType("diffusers")
-        return mod
-    if root == "torch":
-        mod = sys.modules.get("torch")
-        if mod is None:
-            return ModuleType("torch")
-        return mod
-    if root in {"transformers", "deepspeed", "accelerate", "xformers"}:
-        raise ImportError("Local ML libraries are disabled; use providers.")
-    return _orig_import(name, *args, **kwargs)
-
-builtins.__import__ = _blocked_import
 from io import BytesIO
 import asyncio
 import inspect
 from fractions import Fraction
-from types import ModuleType
 
 
 print("Python: " + sys.version)
 
 # Get the path of the Python executable (e.g., python.exe)
 python_exe_dir = os.path.dirname(os.__file__)
-
-
-def _download_image(url: str) -> Image.Image:
-    resp = requests.get(url, timeout=60)
-    resp.raise_for_status()
-    return Image.open(BytesIO(resp.content)).convert("RGB")
-
-
-class FalPipelineShim:
-    def __init__(self, *, model_id: str | None = None):
-        from .pipelines.flux_fal_adapter import FluxFalAdapter
-        self._adapter = FluxFalAdapter(model_id=model_id)
-
-        class _VAE:
-            def enable_tiling(self):
-                return None
-
-            @property
-            def config(self):
-                return SimpleNamespace(shift_factor=0, scaling_factor=1)
-
-        self.vae = _VAE()
-
-    # no-op device/optimization methods for compatibility
-    def to(self, *_, **__):
-        return self
-
-    def enable_model_cpu_offload(self, *_, **__):
-        return None
-
-    def enable_vae_slicing(self, *_, **__):
-        return None
-
-    def __call__(self, *args, **kwargs):
-        prompt = kwargs.get("prompt")
-        if prompt is None and args:
-            prompt = args[0]
-        arguments = dict(kwargs)
-        if "prompt" in arguments:
-            del arguments["prompt"]
-        result = self._adapter(prompt or "", arguments=arguments)
-        images = result.get("images") if isinstance(result, dict) else None
-        if images and isinstance(images, list) and images and isinstance(images[0], dict) and images[0].get("url"):
-            try:
-                pil = _download_image(images[0]["url"])
-                return SimpleNamespace(images=[pil])
-            except Exception:
-                return SimpleNamespace(images=[])
-        return result
-
-
-def _download_file(url: str, suffix: str) -> str:
-    import tempfile
-    resp = requests.get(url, stream=True, timeout=300)
-    resp.raise_for_status()
-    fd, path = tempfile.mkstemp(suffix=suffix)
-    with os.fdopen(fd, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=8192):
-            if chunk:
-                f.write(chunk)
-    return path
-
-
-def _extract_first_frame(video_path: str, *, width: int | None = None, height: int | None = None) -> Image.Image | None:
-    # Try using ffmpeg if available
-    try:
-        import tempfile
-        out_fd, out_path = tempfile.mkstemp(suffix=".png")
-        os.close(out_fd)
-        scale = []
-        if width and height:
-            scale = ["-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease"]
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            video_path,
-            *scale,
-            "-frames:v",
-            "1",
-            out_path,
-        ]
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        try:
-            return Image.open(out_path).convert("RGB")
-        finally:
-            try:
-                os.remove(out_path)
-            except Exception:
-                pass
-    except Exception:
-        pass
-    return None
-
-
-class VideoFalShim:
-    def __init__(self, *, model_id: str | None = None):
-        from .pipelines.video_fal_adapter import VideoFalAdapter
-        self._adapter = VideoFalAdapter(model_id=model_id)
-
-    def __call__(self, *args, **kwargs):
-        prompt = kwargs.get("prompt")
-        if prompt is None and args:
-            prompt = args[0]
-        arguments = dict(kwargs)
-        if "prompt" in arguments:
-            del arguments["prompt"]
-        result = self._adapter(prompt or "", arguments=arguments)
-
-        # Try to surface frames[0] compatibility
-        url = None
-        if isinstance(result, dict):
-            # Common Fal patterns: {"video":{"url":...}} or top-level list/urls
-            if "video" in result and isinstance(result["video"], dict):
-                url = result["video"].get("url")
-            elif "videos" in result and isinstance(result["videos"], list) and result["videos"]:
-                first = result["videos"][0]
-                if isinstance(first, dict):
-                    url = first.get("url")
-            elif "url" in result:
-                url = result.get("url")
-
-        pil = None
-        if url:
-            try:
-                vpath = _download_file(url, ".mp4")
-                pil = _extract_first_frame(vpath, width=kwargs.get("width"), height=kwargs.get("height"))
-            except Exception:
-                pil = None
-        if pil is None:
-            try:
-                # Fallback placeholder
-                w = int(kwargs.get("width") or 512)
-                h = int(kwargs.get("height") or 512)
-                pil = Image.new("RGB", (w, h), (0, 0, 0))
-            except Exception:
-                pil = Image.new("RGB", (512, 512), (0, 0, 0))
-
-        return SimpleNamespace(frames=[pil])
-
-
-class _FakeTensor:
-    def __init__(self, arr):
-        self._arr = arr
-
-    @property
-    def T(self):
-        return _FakeTensor(self._arr.T)
-
-    def float(self):
-        return self
-
-    def cpu(self):
-        return self
-
-    def numpy(self):
-        return self._arr
-
-
-class AudioFalShim:
-    def __init__(self, *, model_id: str | None = None):
-        from .providers.media_fal import generate_audio
-        self._run = generate_audio
-
-        class _VAE:
-            def __init__(self):
-                self.sampling_rate = 44100
-
-        self.vae = _VAE()
-
-    def __call__(self, *args, **kwargs):
-        prompt = kwargs.get("prompt")
-        if prompt is None and args:
-            prompt = args[0]
-        arguments = dict(kwargs)
-        if "prompt" in arguments:
-            del arguments["prompt"]
-        result = self._run(model_id=None, arguments={"prompt": prompt, **arguments})
-
-        url = None
-        if isinstance(result, dict):
-            if "audio" in result and isinstance(result["audio"], dict):
-                url = result["audio"].get("url")
-            elif "url" in result:
-                url = result.get("url")
-
-        if not url:
-            return SimpleNamespace(audios=[_FakeTensor(np.zeros((2, 1), dtype=np.float32))])
-
-        try:
-            # Download and convert to wav via ffmpeg, then read with wave
-            src = _download_file(url, ".audio")
-            wav_path = src + ".wav"
-            cmd = ["ffmpeg", "-y", "-i", src, wav_path]
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            import wave
-            wf = wave.open(wav_path, "rb")
-            self.vae.sampling_rate = wf.getframerate()
-            n_channels = wf.getnchannels()
-            n_frames = wf.getnframes()
-            frames = wf.readframes(n_frames)
-            wf.close()
-            os.remove(wav_path)
-            arr = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
-            arr = arr.reshape(-1, n_channels).T  # (channels, samples)
-            return SimpleNamespace(audios=[_FakeTensor(arr)])
-        except Exception:
-            return SimpleNamespace(audios=[_FakeTensor(np.zeros((2, 1), dtype=np.float32))])
-
-
-# Provide minimal diffusers stubs so legacy branches using Flux work without local models
-diffusers_stub = ModuleType("diffusers")
-
-class _BitsAndBytesConfig:
-    def __init__(self, *_, **__):
-        pass
-
-class _FluxTransformer2DModel:
-    @classmethod
-    def from_pretrained(cls, *_, **__):
-        return cls()
-
-class _FluxPipeline:
-    @classmethod
-    def from_pretrained(cls, *_, **kwargs):
-        model_id = kwargs.get("transformer") and getattr(kwargs.get("transformer"), "model_id", None)
-        return FalPipelineShim(model_id=model_id)
-
-class _FluxKontextPipeline:
-    @classmethod
-    def from_pretrained(cls, *_, **kwargs):
-        model_id = kwargs.get("transformer") and getattr(kwargs.get("transformer"), "model_id", None)
-        return FalPipelineShim(model_id=model_id)
-
-setattr(diffusers_stub, "BitsAndBytesConfig", _BitsAndBytesConfig)
-setattr(diffusers_stub, "FluxTransformer2DModel", _FluxTransformer2DModel)
-setattr(diffusers_stub, "FluxPipeline", _FluxPipeline)
-setattr(diffusers_stub, "FluxKontextPipeline", _FluxKontextPipeline)
-
-# Additional image pipelines mapped to Fal image shim
-class _QwenImagePipeline(_FluxPipeline):
-    pass
-
-class _QwenImageImg2ImgPipeline(_FluxPipeline):
-    pass
-
-setattr(diffusers_stub, "QwenImagePipeline", _QwenImagePipeline)
-setattr(diffusers_stub, "QwenImageImg2ImgPipeline", _QwenImageImg2ImgPipeline)
-
-_VIDEO_PIPELINE_HINTS = {
-    "CogVideoXPipeline",
-    "CogVideoXImageToVideoPipeline",
-    "CogVideoXVideoToVideoPipeline",
-    "HunyuanVideoPipeline",
-    "HunyuanVideoImageToVideoPipeline",
-    "HunyuanVideoFramepackPipeline",
-    "HunyuanSkyreelsImageToVideoPipeline",
-    "MochiPipeline",
-    "WanPipeline",
-    "WanImageToVideoPipeline",
-    "WanVACEPipeline",
-    "LTXConditionPipeline",
-    "AnimateDiffPipeline",
-    "StableDiffusionXLImg2ImgPipeline",
-}
-
-def _make_pipeline_factory(name: str):
-    class _GenericPipeline:
-        @classmethod
-        def from_pretrained(cls, *_, **kwargs):
-            if ("Video" in name) or (name in _VIDEO_PIPELINE_HINTS):
-                return VideoFalShim()
-            if ("Audio" in name) or (name in _AUDIO_PIPELINE_HINTS):
-                return AudioFalShim()
-            return FalPipelineShim()
-    _GenericPipeline.__name__ = name
-    return _GenericPipeline
-
-def __getattr__(name: str):
-    if name.endswith("Pipeline") and not hasattr(diffusers_stub, name):
-        factory = _make_pipeline_factory(name)
-        setattr(diffusers_stub, name, factory)
-        return factory
-    raise AttributeError(name)
-
-setattr(diffusers_stub, "__getattr__", __getattr__)
-
-sys.modules.setdefault("diffusers", diffusers_stub)
-
-# minimal torch stub used by legacy branches (e.g., torch.bfloat16 checks)
-torch_stub = ModuleType("torch")
-setattr(torch_stub, "bfloat16", object())
-
-class _Backends:
-    class _MPS:
-        @staticmethod
-        def is_available():
-            return False
-
-    mps = _MPS()
-
-setattr(torch_stub, "backends", _Backends())
-sys.modules.setdefault("torch", torch_stub)
-
-# minimal transformers stub for BitsAndBytesConfig & text encoders referenced
-transformers_stub = ModuleType("transformers")
-
-class _TransformersBitsAndBytesConfig:
-    def __init__(self, *_, **__):
-        pass
-
-class _QwenTextEncoder:
-    @classmethod
-    def from_pretrained(cls, *_, **__):
-        return cls()
-
-setattr(transformers_stub, "BitsAndBytesConfig", _TransformersBitsAndBytesConfig)
-setattr(transformers_stub, "Qwen2_5_VLForConditionalGeneration", _QwenTextEncoder)
-
-sys.modules.setdefault("transformers", transformers_stub)
 
 # Construct the path to the site-packages directory
 site_packages_dir = os.path.join(python_exe_dir, "site-packages")
@@ -450,7 +97,7 @@ final_site_paths = []
 for path in unique_ordered_paths:
     if path in site_paths_to_move or 'site-packages' in path:
         final_site_paths.append(path)
-    elif not REMOTE_ONLY:
+    else:
         non_site_paths.append(path)
 
 sys.path[:] = non_site_paths + final_site_paths
@@ -486,7 +133,7 @@ try:
     else:
         gfx_device = "cpu"
     # Set environment variables for better MPS performance
-    if (not REMOTE_ONLY) and os_platform == "Darwin":
+    if os_platform == "Darwin":
         os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
         # Disable oneDNN optimizations that can cause issues on Apple Silicon
         os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
@@ -1187,78 +834,58 @@ def install_modules(self):
 
     def install_module(name, package=None, use_git=False):
         package = package if package else name
-        # Skip heavy local ML deps in remote-only mode
-        if REMOTE_ONLY:
-            blocked = {
-                "torch","torchvision","torchaudio","xformers","diffusers","transformers",
-                "sentencepiece","safetensors","bitsandbytes","deepspeed","accelerate",
-                "sageattention","timm","tokenizers","protobuf","imageio","imWatermark",
-                "controlnet-aux","laion-clap","whisperspeech","parler-tts","mmaudio",
-                "stable-audio-tools","resemble-perth","s3tokenizer","conformer","jax","jaxlib",
-            }
-            pkg_str = str(package)
-            nm_str = str(name)
-            if nm_str in blocked or any(b in pkg_str for b in blocked):
-                print(f"Remote-only: skipping install of {package}")
-                return
         try:
             subprocess.check_call([
-                pybin, "-m", "pip", "install", package,
+                pybin, "-m", "pip", "install", "--disable-pip-version-check",
+                "--use-deprecated=legacy-resolver", package,
                 "--no-warn-script-location", "--upgrade"
             ])
-            print(f"Installed {package}")
+            print(f"Successfully installed {name}")
         except subprocess.CalledProcessError as e:
             print(f"Error installing {name}: {e}")
             return False
         return True
 
-    # Common modules (trimmed for REMOTE_ONLY)
-    if REMOTE_ONLY:
-        common_modules = [
-            ("requests", "requests"),
-            ("PIL", "pillow"),
-            ("pydub", "pydub"),
-        ]
-    else:
-        common_modules = [
-            ("requests", "requests"),
-            #("huggingface_hub", "huggingface_hub"),
-            ("huggingface_hub", "huggingface_hub[hf_xet]"), 
-            ("gguf", "gguf"),
-            ("pydub", "pydub"),
-            ("sentencepiece", "sentencepiece"),
-            ("safetensors", "safetensors"),
-            ("cv2", "opencv_python"),
-            ("PIL", "pillow"),
-            ("IPython", "IPython"),
-            ("omegaconf", "omegaconf"),
-            ("aura_sr", "aura-sr"),
-            ("stable_audio_tools", "stable-audio-tools"),
-            ("beautifulsoup4", "beautifulsoup4"),
-            ("ftfy", "ftfy"),
-            ("librosa", "librosa"),
-            ("imageio", "imageio[ffmpeg]==2.4.1"),
-            ("imageio", "imageio-ffmpeg"),
-            ("imWatermark", "imWatermark"),
-            ("mediapipe", "mediapipe"),
-            ("scipy", "scipy"), #scipy==1.12.0
-            ("protobuf", "protobuf==3.20.1"),
-            ("scikit_learn", "scikit-learn==1.2.2"),
-            ("bitsandbytes", "bitsandbytes"),
-            #("chatterbox", "--no-deps git+https://https://github.com/tin2tin/chatterbox.git"),
-            ("chatterbox", "--no-deps chatterbox-tts"),
-            ("numpy", "numpy==1.26.4"),
-            ("jax", "jax"),
-            #("jaxlib", "jaxlib>=0.5.0")
-            ("tqdm", "tqdm"),
-            ("tempfile", "tempfile"),
-            ("f5_tts", "git+https://github.com/SWivid/F5-TTS.git"),
-            ("resemble_perth", "resemble-perth==1.0.1"),
-            ("s3tokenizer", "s3tokenizer"),
-            ("conformer", "conformer"),
-            ("spacy", "spacy"),
-            ("hf_xet", "hf-xet"),
-        ]
+    # Common modules
+    common_modules = [
+        ("requests", "requests"),
+        #("huggingface_hub", "huggingface_hub"),
+        ("huggingface_hub", "huggingface_hub[hf_xet]"), 
+        ("gguf", "gguf"),
+        ("pydub", "pydub"),
+        ("sentencepiece", "sentencepiece"),
+        ("safetensors", "safetensors"),
+        ("cv2", "opencv_python"),
+        ("PIL", "pillow"),
+        ("IPython", "IPython"),
+        ("omegaconf", "omegaconf"),
+        ("aura_sr", "aura-sr"),
+        ("stable_audio_tools", "stable-audio-tools"),
+        ("beautifulsoup4", "beautifulsoup4"),
+        ("ftfy", "ftfy"),
+        ("librosa", "librosa"),
+        ("imageio", "imageio[ffmpeg]==2.4.1"),
+        ("imageio", "imageio-ffmpeg"),
+        ("imWatermark", "imWatermark"),
+        ("mediapipe", "mediapipe"),
+        ("scipy", "scipy"), #scipy==1.12.0
+        ("protobuf", "protobuf==3.20.1"),
+        ("scikit_learn", "scikit-learn==1.2.2"),
+        ("bitsandbytes", "bitsandbytes"),
+        #("chatterbox", "--no-deps git+https://https://github.com/tin2tin/chatterbox.git"),
+        ("chatterbox", "--no-deps chatterbox-tts"),
+        ("numpy", "numpy==1.26.4"),
+        ("jax", "jax"),
+        #("jaxlib", "jaxlib>=0.5.0")
+        ("tqdm", "tqdm"),
+        ("tempfile", "tempfile"),
+        ("f5_tts", "git+https://github.com/SWivid/F5-TTS.git"),
+        ("resemble_perth", "resemble-perth==1.0.1"),
+        ("s3tokenizer", "s3tokenizer"),
+        ("conformer", "conformer"),
+        ("spacy", "spacy"),
+        ("hf_xet", "hf-xet"),
+    ]
 
     show_system_console(True)
     set_system_console_topmost(True)
@@ -1268,7 +895,7 @@ def install_modules(self):
         install_module(module_name, package_name)
 
     # Platform-specific installations
-    if (not REMOTE_ONLY) and os_platform == "Windows":
+    if os_platform == "Windows":
         windows_modules = [
             # How to install a patch: git+https://github.com/huggingface/diffusers@integrations/ltx-097
             #("diffusers", "diffusers==0.34.0"),
@@ -1317,26 +944,25 @@ def install_modules(self):
     # Python version-specific installations
     from packaging import version
     python_version = sys.version_info
-    if (not REMOTE_ONLY) and version.parse(".".join(map(str, python_version[:3]))) >= version.parse("3.8"):
+    if version.parse(".".join(map(str, python_version[:3]))) >= version.parse("3.8"):
         install_module("image_gen_aux", "git+https://github.com/huggingface/image_gen_aux")
 
     # Additional installations
 #    subprocess.check_call([
 #        pybin, "-m", "spacy", "download", "en_core_web_md",
 #    ])
-    if not REMOTE_ONLY:
-        subprocess.call(
-            [
-                pybin,
-                "-m",
-                "pip",
-                "install",
-                "https://github.com/explosion/spacy-models/releases/download/en_core_web_md-3.8.0/en_core_web_md-3.8.0-py3-none-any.whl",
-                "--no-deps",
-                "--disable-pip-version-check",
-                "--no-warn-script-location",
-            ]
-        )
+    subprocess.call(
+        [
+            pybin,
+            "-m",
+            "pip",
+            "install",
+            "https://github.com/explosion/spacy-models/releases/download/en_core_web_md-3.8.0/en_core_web_md-3.8.0-py3-none-any.whl",
+            "--no-deps",
+            "--disable-pip-version-check",
+            "--no-warn-script-location",
+        ]
+    )
 #    subprocess.check_call([
 #        pybin, "-m", "pip", "install", "--disable-pip-version-check",
 #        "--use-deprecated=legacy-resolver", "tensorflow<2.11", "--upgrade"

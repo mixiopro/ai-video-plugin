@@ -1,0 +1,5 @@
+{
+  "image_model_id": "fal-ai/flux-pro/kontext",
+  "video_model_id": "fal-ai/veo3.1/fast",
+  "audio_model_id": ""
+}
