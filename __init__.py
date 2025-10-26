@@ -65,8 +65,6 @@ import sys
 import base64
 import builtins
 from types import SimpleNamespace
-from PIL import Image
-import requests
 REMOTE_ONLY = True
 
 _orig_import = builtins.__import__
@@ -103,7 +101,10 @@ print("Python: " + sys.version)
 python_exe_dir = os.path.dirname(os.__file__)
 
 
-def _download_image(url: str) -> Image.Image:
+def _download_image(url: str):
+    # Lazy import to avoid requiring Pillow/requests at addon load time
+    import requests  # type: ignore
+    from PIL import Image  # type: ignore
     resp = requests.get(url, timeout=60)
     resp.raise_for_status()
     return Image.open(BytesIO(resp.content)).convert("RGB")
@@ -164,9 +165,10 @@ def _download_file(url: str, suffix: str) -> str:
     return path
 
 
-def _extract_first_frame(video_path: str, *, width: int | None = None, height: int | None = None) -> Image.Image | None:
+def _extract_first_frame(video_path: str, *, width: int | None = None, height: int | None = None):
     # Try using ffmpeg if available
     try:
+        from PIL import Image  # type: ignore
         import tempfile
         out_fd, out_path = tempfile.mkstemp(suffix=".png")
         os.close(out_fd)
@@ -233,6 +235,7 @@ class VideoFalShim:
         if pil is None:
             try:
                 # Fallback placeholder
+                from PIL import Image  # type: ignore
                 w = int(kwargs.get("width") or 512)
                 h = int(kwargs.get("height") or 512)
                 pil = Image.new("RGB", (w, h), (0, 0, 0))
